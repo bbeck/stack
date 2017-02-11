@@ -1,0 +1,12 @@
+# IntelliJ/PyCharm Files
+.idea/
+*.ipr
+*.iws
+*.iml
+
+# Build outputs
+*.pyc
+
+# OS hidden files
+.DS_Store
+
