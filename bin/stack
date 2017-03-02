@@ -1,0 +1,205 @@
+#!/usr/bin/env python -u -B
+import argparse
+import boto3
+import errno
+import imp
+import os.path
+import stack
+import stack.commands
+import sys
+
+
+def load_template_module(path):
+  r"""
+  Dynamically load the code in `path` as a module.
+
+  :param path: The path to load as a module.
+  :return:  A Python module loaded from `path`.
+  """
+  if path is None or not os.path.exists(path):
+    return None
+
+  filename = os.path.basename(path)
+  name = os.path.splitext(filename)[0].replace("-", "_")
+  return imp.load_source(name, path)
+
+
+def help_format(prog):
+  r"""Configuration for how argparse should print help to the console."""
+  kwargs = dict(max_help_position=40, width=120)
+  return argparse.HelpFormatter(prog, **kwargs)
+
+
+def error(message, *args):
+  r"""
+  Print an error message and then exit the application.
+
+  :param message: The message to display -- can contain substitution variables.
+  :param args: Optional substitution variables.
+  """
+  print message % args
+  sys.exit(1)
+
+
+def main():
+  parser = argparse.ArgumentParser(formatter_class=help_format)
+  parser.add_argument("--aws-profile", default="default",
+                      help="the aws credentials profile to use")
+  parser.add_argument("--aws-region", default="us-east-1",
+                      help="the aws region to execute in")
+  commands = parser.add_subparsers(dest="command", title="commands")
+
+  #
+  # Create command
+  #
+  create = commands.add_parser("create", add_help=False,
+                               formatter_class=help_format,
+                               help="create a new cloudformation stack")
+  create.add_argument("-h", "--help", action="store_true",
+                      help="show this help message and exit")
+  create.set_defaults(subparser=create, func=stack.commands.create_stack)
+
+  #
+  # Update command
+  #
+  update = commands.add_parser("update", add_help=False,
+                               formatter_class=help_format,
+                               help="update an existing cloudformation stack")
+  update.add_argument("-h", "--help", action="store_true",
+                      help="show this help message and exit")
+  update.set_defaults(subparser=update, func=stack.commands.update_stack)
+
+  #
+  # Remove command
+  #
+  remove = commands.add_parser("remove", add_help=False,
+                               formatter_class=help_format,
+                               help="remove an existing cloudformation stack")
+  remove.add_argument("-h", "--help", action="store_true",
+                      help="show this help message and exit")
+  remove.set_defaults(subparser=remove, func=stack.commands.remove_stack)
+
+  #
+  # JSON command
+  #
+  json = commands.add_parser("json", add_help=False,
+                             formatter_class=help_format,
+                             help="convert a stack to cloudformation json")
+  json.add_argument("-h", "--help", action="store_true",
+                    help="show this help message and exit")
+  json.add_argument("-i", "--indent", type=int, default=2,
+                    help="the number of spaces to use for indenting")
+  json.set_defaults(subparser=json, func=stack.commands.print_stack)
+
+  #
+  # Diff command
+  #
+  diff = commands.add_parser("diff", add_help=False,
+                             formatter_class=help_format,
+                             help="show the differences a stack would cause")
+  diff.add_argument("-h", "--help", action="store_true",
+                    help="show this help message and exit")
+  diff.set_defaults(subparser=diff, func=stack.commands.diff_stack)
+
+  # Add the last so that it shows up in the help properly
+  parser.add_argument("template", nargs="?",
+                      help="the stack template")
+
+  # Because stacks themselves can add additional arguments to the parser we're
+  # going to do a two phased parsing of command line arguments.  The first
+  # phase happens to determine which command we're going to run, and which
+  # stack template is going to be used.  After we know this information, we'll
+  # load the stack template, add its arguments and then perform a second phase
+  # of command line argument parsing that takes everything into account.
+  args, extra = parser.parse_known_args()
+
+  # Now that the command line has been partially parsed, determine which
+  # parameter is the name of the stack template to load.  Unfortunately
+  # because the stack itself can add new parameters we may have arguments that
+  # haven't been parsed, so it's not trivial to identify the stack parameter.
+  # As a heuristic we'll look at each argument and see if it's the name of a
+  # file and if it is, assume that that was the stack template.
+  template_filename = None
+  for (i, arg) in enumerate(extra):
+    if os.path.exists(arg):
+      template_filename = arg
+      del extra[i]
+      break
+
+  # Load the module
+  module = load_template_module(template_filename)
+
+  # Add the template's args to the subparser so that if we print help we get a
+  # proper usage.  This will also allow us to parse the full set of arguments.
+  if module and hasattr(module, "__stack_args__"):
+    module.__stack_args__(args.subparser)
+
+  if args.help:
+    args.subparser.print_help()
+    return
+
+  if not module:
+    args.subparser.print_usage()
+    error("A stack template is required.")
+    return
+
+  # Validate the module
+  if not hasattr(module, "__stack__"):
+    error("Template '%s' must have a __stack__ method.", template_filename)
+    return
+
+  # Now that everything is loaded do the second phase of parsing of command
+  # line arguments.  This second parse will also do a validation of the
+  # arguments to make sure that everything is valid.
+  args = args.subparser.parse_args(extra, namespace=args)
+
+  # Generate the template instance
+  template = module.__stack__(args)
+
+  # Determine the name of the stack template.
+  if hasattr(module, "__stack_name__"):
+    stack_name = module.__stack_name__(args)
+  else:
+    stack_name = os.path.basename(template_filename)
+
+  # Determine tags for the stack template.
+  if hasattr(module, "__stack_tags__"):
+    stack_tags = module.__stack_tags__(args)
+  else:
+    stack_tags = dict()
+
+  # Build our stack
+  s = stack.Stack(filename=template_filename,
+                  module=module,
+                  name=stack_name,
+                  tags=stack_tags,
+                  template=template)
+
+  # Connect to Amazon
+  aws = boto3.Session(profile_name=args.aws_profile,
+                      region_name=args.aws_region)
+
+  # Execute our command
+  return args.func(s, args, aws)
+
+
+if __name__ == "__main__":
+  try:
+    success = main()
+  except KeyboardInterrupt:
+    # The user asked the program to exit
+    sys.exit(1)
+  except IOError, e:
+    # When this program is used in a shell pipeline and an earlier program in
+    # the pipeline is terminated, we'll receive an EPIPE error.  This is normal
+    # and just an indication that we should exit after processing whatever
+    # input we've received -- we don't consume standard input so we can just
+    # exit cleanly in that case.
+    if e.errno != errno.EPIPE:
+      raise
+
+    # We still exit with a non-zero exit code though in order to propagate the
+    # error code of the earlier process that was terminated.
+    sys.exit(1)
+
+  sys.exit(0 if success else 1)

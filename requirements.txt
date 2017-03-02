@@ -1,0 +1,5 @@
+attrs ~= 16.3.0
+boto3 ~= 1.4.0
+pytz >= 2016.10
+troposphere ~= 1.9.0
+tzlocal ~= 1.3.0
